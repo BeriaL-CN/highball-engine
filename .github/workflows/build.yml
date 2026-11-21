@@ -154,11 +154,21 @@ jobs:
           tests/private-namespaces/build.sh
           rm -rf probe-prefix-64 probe-prefix-32 probe-output
           mkdir -p probe-output
+          set +e
           WINEARCH=win64 tests/private-namespaces/run.sh \
             "$PWD/out/engine/bin/wine" "$PWD/probe-prefix-64" "$PWD/probe-output" private_ns_probe.exe
+          status64=$?
+          cat "$PWD/probe-output/private_ns_probe.exe.txt"
+          set -e
+          test "$status64" -eq 0
           tests/private-namespaces/verify.sh "$PWD/probe-output/private_ns_probe.exe.txt"
+          set +e
           WINEARCH=win32 tests/private-namespaces/run.sh \
             "$PWD/out/engine/bin/wine" "$PWD/probe-prefix-32" "$PWD/probe-output" private_ns_probe32.exe
+          status32=$?
+          cat "$PWD/probe-output/private_ns_probe32.exe.txt"
+          set -e
+          test "$status32" -eq 0
           tests/private-namespaces/verify.sh "$PWD/probe-output/private_ns_probe32.exe.txt"
           mkdir -p out/tests/private-namespaces
           cp probe-output/*.txt out/tests/private-namespaces/
