@@ -145,12 +145,28 @@ jobs:
           tar -C out -czf "${name}.tar.gz" .
           shasum -a 256 "${name}.tar.gz" | tee "${name}.tar.gz.sha256"
           ls -la "${name}.tar.gz"
+      - name: private namespace API probe
+        run: |
+          set -euo pipefail
+          tests/private-namespaces/build.sh
+          rm -rf probe-prefix-64 probe-prefix-32 probe-output
+          mkdir -p probe-output
+          WINEARCH=win64 tests/private-namespaces/run.sh \
+            "$PWD/out/engine/bin/wine" "$PWD/probe-prefix-64" "$PWD/probe-output" private_ns_probe.exe
+          tests/private-namespaces/verify.sh "$PWD/probe-output/private_ns_probe.exe.txt"
+          WINEARCH=win32 tests/private-namespaces/run.sh \
+            "$PWD/out/engine/bin/wine" "$PWD/probe-prefix-32" "$PWD/probe-output" private_ns_probe32.exe
+          tests/private-namespaces/verify.sh "$PWD/probe-output/private_ns_probe32.exe.txt"
+          mkdir -p out/tests/private-namespaces
+          cp probe-output/*.txt out/tests/private-namespaces/
+          cp tests/private-namespaces/reference/*.txt out/tests/private-namespaces/
       - uses: actions/upload-artifact@v4
         with:
           name: engine
           path: |
             engine-*.tar.gz
             engine-*.tar.gz.sha256
+            out/tests/private-namespaces/*.txt
           retention-days: 14
       - name: publish release
         if: ${{ github.event.inputs.publish_release == 'true' }}
