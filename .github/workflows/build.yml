@@ -163,7 +163,9 @@ jobs:
           test "$status64" -eq 0
           tests/private-namespaces/verify.sh "$PWD/probe-output/private_ns_probe.exe.txt"
           set +e
-          WINEARCH=win32 tests/private-namespaces/run.sh \
+          # This Wine11 build is wow64-only and rejects a legacy WINEARCH=win32 prefix;
+          # run the 32-bit PE probe through wow64 in a separate win64 prefix instead.
+          WINEARCH=win64 tests/private-namespaces/run.sh \
             "$PWD/out/engine/bin/wine" "$PWD/probe-prefix-32" "$PWD/probe-output" private_ns_probe32.exe
           status32=$?
           cat "$PWD/probe-output/private_ns_probe32.exe.txt"

@@ -15,5 +15,7 @@ must not be silently treated as a regression.
 
 Build the 64-bit and 32-bit probes with `build.sh`; run them only in disposable
 prefixes with `run.sh`, then apply the stable API assertions with `verify.sh`.
+The Highball Wine11 build is wow64-only, so its 32-bit probe runs through a
+separate win64 prefix rather than a legacy `WINEARCH=win32` prefix.
 Never run the probe against the Games bottle or a live game.
 
