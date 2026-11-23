@@ -2,9 +2,6 @@
 # build is green and boots a bottle through Highball; nothing in the app points here yet.
 name: build-engine
 on:
-  push:
-    branches:
-      - leigod-macos
   workflow_dispatch:
     inputs:
       publish_release:
