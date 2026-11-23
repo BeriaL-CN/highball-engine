@@ -172,6 +172,34 @@ jobs:
           mkdir -p out/tests/private-namespaces
           cp probe-output/*.txt out/tests/private-namespaces/
           cp tests/private-namespaces/reference/*.txt out/tests/private-namespaces/
+      - name: ReadDirectoryChangesW Darwin probe
+        run: |
+          set -euo pipefail
+          tests/read-directory-changes/build.sh
+          rm -rf probe-prefix-dirwatch-64 probe-prefix-dirwatch-32 probe-output-dirwatch
+          mkdir -p probe-output-dirwatch
+          set +e
+          WINEARCH=win64 tests/read-directory-changes/run.sh \
+            "$PWD/out/engine/bin/wine" "$PWD/probe-prefix-dirwatch-64" "$PWD/probe-output-dirwatch"
+          status64=$?
+          cat "$PWD/probe-output-dirwatch/read_directory_changes.exe.txt"
+          set -e
+          test "$status64" -eq 0
+          tests/read-directory-changes/verify.sh \
+            "$PWD/probe-output-dirwatch/read_directory_changes.exe.txt"
+          set +e
+          WINEARCH=win64 tests/read-directory-changes/run.sh \
+            "$PWD/out/engine/bin/wine" "$PWD/probe-prefix-dirwatch-32" "$PWD/probe-output-dirwatch" \
+            read_directory_changes32.exe
+          status32=$?
+          cat "$PWD/probe-output-dirwatch/read_directory_changes32.exe.txt"
+          set -e
+          test "$status32" -eq 0
+          tests/read-directory-changes/verify.sh \
+            "$PWD/probe-output-dirwatch/read_directory_changes32.exe.txt"
+          mkdir -p out/tests/read-directory-changes
+          cp probe-output-dirwatch/*.txt out/tests/read-directory-changes/
+          cp tests/read-directory-changes/README.md out/tests/read-directory-changes/
       - uses: actions/upload-artifact@v4
         with:
           name: engine
@@ -179,6 +207,7 @@ jobs:
             engine-*.tar.gz
             engine-*.tar.gz.sha256
             out/tests/private-namespaces/*.txt
+            out/tests/read-directory-changes/*
           retention-days: 14
       - name: publish release
         if: ${{ github.event.inputs.publish_release == 'true' }}

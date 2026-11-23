@@ -1,0 +1,403 @@
+--- a/server/change.c
++++ b/server/change.c
+@@ -31,8 +31,12 @@
+ #include <limits.h>
+ #include <dirent.h>
+ #include <errno.h>
++#include <string.h>
+ #include <unistd.h>
+ #include <poll.h>
++#ifdef __APPLE__
++#include <sys/event.h>
++#endif
+ #ifdef HAVE_SYS_INOTIFY_H
+ #include <sys/inotify.h>
+ #endif
+@@ -94,8 +98,33 @@
+     struct inode  *inode;    /* inode of the associated directory */
+     struct process *client_process;  /* client process that has a cache for this directory */
+     int             client_entry;    /* entry in client process cache */
++#ifdef __APPLE__
++    int             darwin_registered;
++    struct list     darwin_snapshot;
++#endif
+ };
+ 
++#ifdef __APPLE__
++struct darwin_entry
++{
++    struct list entry;
++    char *name;
++    ino_t ino;
++    mode_t mode;
++    off_t size;
++    struct timespec mtime;
++    struct timespec ctime;
++    int matched;
++};
++
++static struct fd *darwin_kqueue_fd;
++static unsigned int darwin_cookie = 1;
++
++static int darwin_adjust_changes( struct dir *dir );
++static void darwin_remove_watch( struct dir *dir );
++static void darwin_free_snapshot( struct list *snapshot );
++#endif
++
+ static struct fd *dir_get_fd( struct object *obj );
+ static struct security_descriptor *dir_get_sd( struct object *obj );
+ static int dir_set_sd( struct object *obj, const struct security_descriptor *sd,
+@@ -440,6 +469,10 @@
+         free_inode( dir->inode );
+     }
+ 
++#ifdef __APPLE__
++    darwin_remove_watch( dir );
++#endif
++
+     while ((record = get_first_change_record( dir ))) free( record );
+ 
+     release_dir_cache_entry( dir );
+@@ -450,6 +483,14 @@
+         release_object( inotify_fd );
+         inotify_fd = NULL;
+     }
++
++#ifdef __APPLE__
++    if (darwin_kqueue_fd && list_empty( &change_list ))
++    {
++        release_object( darwin_kqueue_fd );
++        darwin_kqueue_fd = NULL;
++    }
++#endif
+ }
+ 
+ struct dir *get_dir_obj( struct process *process, obj_handle_t handle, unsigned int access )
+@@ -465,8 +506,302 @@
+ static enum server_fd_type dir_get_fd_type( struct fd *fd )
+ {
+     return FD_TYPE_DIR;
++}
++
++#ifdef __APPLE__
++
++static int darwin_get_poll_events( struct fd *fd )
++{
++    return POLLIN;
++}
++
++static struct darwin_entry *darwin_find_name( struct list *snapshot, const char *name )
++{
++    struct darwin_entry *entry;
++
++    LIST_FOR_EACH_ENTRY( entry, snapshot, struct darwin_entry, entry )
++        if (!strcmp( entry->name, name )) return entry;
++    return NULL;
++}
++
++static struct darwin_entry *darwin_find_inode( struct list *snapshot, const struct darwin_entry *needle )
++{
++    struct darwin_entry *entry;
++
++    LIST_FOR_EACH_ENTRY( entry, snapshot, struct darwin_entry, entry )
++        if (!entry->matched && needle->ino && entry->ino == needle->ino &&
++            ((entry->mode & S_IFMT) == (needle->mode & S_IFMT)))
++            return entry;
++    return NULL;
++}
++
++static void darwin_free_snapshot( struct list *snapshot )
++{
++    struct darwin_entry *entry, *next;
++
++    LIST_FOR_EACH_ENTRY_SAFE( entry, next, snapshot, struct darwin_entry, entry )
++    {
++        list_remove( &entry->entry );
++        free( entry->name );
++        free( entry );
++    }
++}
++
++static int darwin_scan_snapshot( struct dir *dir, struct list *snapshot )
++{
++    struct darwin_entry *entry;
++    struct dirent *dent;
++    struct stat st;
++    DIR *stream;
++    int fd, scan_fd;
++
++    list_init( snapshot );
++    fd = get_unix_fd( dir->fd );
++    if (fd == -1 || (scan_fd = dup( fd )) == -1) return 0;
++    stream = fdopendir( scan_fd );
++    if (!stream)
++    {
++        close( scan_fd );
++        return 0;
++    }
++
++    while ((dent = readdir( stream )))
++    {
++        if (!strcmp( dent->d_name, "." ) || !strcmp( dent->d_name, ".." )) continue;
++        if (fstatat( fd, dent->d_name, &st, AT_SYMLINK_NOFOLLOW ) == -1) continue;
++
++        if (!(entry = malloc( sizeof(*entry) )))
++        {
++            closedir( stream );
++            darwin_free_snapshot( snapshot );
++            return 0;
++        }
++        if (!(entry->name = strdup( dent->d_name )))
++        {
++            free( entry );
++            closedir( stream );
++            darwin_free_snapshot( snapshot );
++            return 0;
++        }
++        entry->ino = st.st_ino;
++        entry->mode = st.st_mode;
++        entry->size = st.st_size;
++        entry->mtime = st.st_mtimespec;
++        entry->ctime = st.st_ctimespec;
++        entry->matched = 0;
++        list_add_tail( snapshot, &entry->entry );
++    }
++
++    closedir( stream );
++    return 1;
+ }
+ 
++static unsigned int darwin_name_filter( const struct darwin_entry *entry )
++{
++    return S_ISDIR( entry->mode ) ? FILE_NOTIFY_CHANGE_DIR_NAME : FILE_NOTIFY_CHANGE_FILE_NAME;
++}
++
++static int darwin_timespec_changed( const struct timespec *a, const struct timespec *b )
++{
++    return a->tv_sec != b->tv_sec || a->tv_nsec != b->tv_nsec;
++}
++
++static unsigned int darwin_metadata_filter( const struct darwin_entry *old,
++                                            const struct darwin_entry *new )
++{
++    unsigned int filter = 0;
++
++    if (old->size != new->size) filter |= FILE_NOTIFY_CHANGE_SIZE;
++    if (darwin_timespec_changed( &old->mtime, &new->mtime ))
++        filter |= FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_LAST_ACCESS;
++    if (old->mode != new->mode)
++        filter |= FILE_NOTIFY_CHANGE_ATTRIBUTES | FILE_NOTIFY_CHANGE_SECURITY;
++    return filter;
++}
++
++static void darwin_queue_change( struct dir *dir, unsigned int action, unsigned int cookie,
++                                 const char *name )
++{
++    struct change_record *record;
++    size_t len = strlen( name );
++
++    if (dir->want_data)
++    {
++        record = malloc( offsetof(struct change_record, event.name[len]) );
++        if (record)
++        {
++            record->cookie = cookie;
++            record->event.action = action;
++            record->event.len = len;
++            memcpy( record->event.name, name, len );
++            list_add_tail( &dir->change_records, &record->entry );
++        }
++    }
++}
++
++static int darwin_emit_change( struct dir *dir, unsigned int action, unsigned int cookie,
++                               const struct darwin_entry *entry, unsigned int filter )
++{
++    if (!(dir->filter & filter)) return 0;
++    darwin_queue_change( dir, action, cookie, entry->name );
++    return 1;
++}
++
++static void darwin_process_watch( struct dir *dir )
++{
++    struct list snapshot;
++    struct darwin_entry *old, *new;
++    unsigned int filter, cookie;
++    int notified = 0;
++
++    if (!darwin_scan_snapshot( dir, &snapshot )) return;
++
++    LIST_FOR_EACH_ENTRY( old, &dir->darwin_snapshot, struct darwin_entry, entry )
++        old->matched = 0;
++
++    LIST_FOR_EACH_ENTRY( old, &dir->darwin_snapshot, struct darwin_entry, entry )
++    {
++        new = darwin_find_name( &snapshot, old->name );
++        if (new && new->ino == old->ino && (new->mode & S_IFMT) == (old->mode & S_IFMT))
++        {
++            old->matched = 1;
++            new->matched = 1;
++            filter = darwin_metadata_filter( old, new );
++            if (filter) notified |= darwin_emit_change( dir, FILE_ACTION_MODIFIED, 0, new, filter );
++        }
++    }
++
++    LIST_FOR_EACH_ENTRY( old, &dir->darwin_snapshot, struct darwin_entry, entry )
++    {
++        if (old->matched) continue;
++        new = darwin_find_inode( &snapshot, old );
++        if (new)
++        {
++            cookie = darwin_cookie++;
++            old->matched = 1;
++            notified |= darwin_emit_change( dir, FILE_ACTION_RENAMED_OLD_NAME, cookie, old,
++                                            darwin_name_filter( old ));
++            new->matched = 1;
++            notified |= darwin_emit_change( dir, FILE_ACTION_RENAMED_NEW_NAME, cookie, new,
++                                            darwin_name_filter( new ));
++        }
++        else
++            notified |= darwin_emit_change( dir, FILE_ACTION_REMOVED, 0, old, darwin_name_filter( old ));
++    }
++
++    LIST_FOR_EACH_ENTRY( new, &snapshot, struct darwin_entry, entry )
++    {
++        old = darwin_find_name( &dir->darwin_snapshot, new->name );
++        if (!new->matched && (!old || !old->matched))
++            notified |= darwin_emit_change( dir, FILE_ACTION_ADDED, 0, new,
++                                            darwin_name_filter( new ) | FILE_NOTIFY_CHANGE_CREATION );
++    }
++
++    darwin_free_snapshot( &dir->darwin_snapshot );
++    list_move_tail( &dir->darwin_snapshot, &snapshot );
++    if (notified) fd_async_wake_up( dir->fd, ASYNC_TYPE_WAIT, STATUS_ALERTED );
++}
++
++static void darwin_poll_event( struct fd *fd, int event )
++{
++    struct kevent events[32];
++    int i, count;
++
++    if (event & (POLLERR | POLLHUP))
++    {
++        set_fd_events( fd, -1 );
++        return;
++    }
++    if (!(event & POLLIN)) return;
++    count = kevent( get_unix_fd( fd ), NULL, 0, events,
++                    sizeof(events) / sizeof(events[0]), NULL );
++    if (count < 0) return;
++    for (i = 0; i < count; i++)
++    {
++        struct dir *dir = events[i].udata;
++        if (dir && events[i].filter == EVFILT_VNODE && !(events[i].flags & EV_ERROR))
++            darwin_process_watch( dir );
++    }
++}
++
++static const struct fd_ops darwin_kqueue_fd_ops =
++{
++    darwin_get_poll_events,
++    darwin_poll_event,
++    NULL,
++    NULL,
++    NULL,
++    NULL,
++    NULL,
++    NULL,
++    NULL,
++    NULL,
++    NULL,
++    NULL
++};
++
++static int darwin_init( void )
++{
++    int unix_fd;
++
++    if (darwin_kqueue_fd) return 1;
++    if ((unix_fd = kqueue()) == -1) return 0;
++    if (!(darwin_kqueue_fd = create_anonymous_fd( &darwin_kqueue_fd_ops, unix_fd, NULL, 0 )))
++    {
++        close( unix_fd );
++        return 0;
++    }
++    set_fd_events( darwin_kqueue_fd, POLLIN );
++    return 1;
++}
++
++static int darwin_adjust_changes( struct dir *dir )
++{
++    struct kevent event;
++    struct list snapshot;
++    int fd;
++
++    /* The first implementation deliberately covers non-recursive watches only. */
++    if (dir->darwin_registered) return 1;
++    if (dir->subtree || !darwin_init()) return 0;
++    fd = get_unix_fd( dir->fd );
++    if (fd == -1) return 0;
++
++    EV_SET( &event, fd, EVFILT_VNODE, EV_ADD | EV_CLEAR,
++            NOTE_WRITE | NOTE_EXTEND | NOTE_ATTRIB | NOTE_LINK | NOTE_RENAME | NOTE_DELETE,
++            0, dir );
++    if (kevent( get_unix_fd( darwin_kqueue_fd ), &event, 1, NULL, 0, NULL ) == -1) return 0;
++    if (!darwin_scan_snapshot( dir, &snapshot ))
++    {
++        EV_SET( &event, fd, EVFILT_VNODE, EV_DELETE, 0, 0, NULL );
++        kevent( get_unix_fd( darwin_kqueue_fd ), &event, 1, NULL, 0, NULL );
++        return 0;
++    }
++
++    darwin_free_snapshot( &dir->darwin_snapshot );
++    list_move_tail( &dir->darwin_snapshot, &snapshot );
++    dir->darwin_registered = 1;
++    return 1;
++}
++
++static void darwin_remove_watch( struct dir *dir )
++{
++    struct kevent event;
++    int fd;
++
++    if (!dir->darwin_registered) return;
++    fd = get_unix_fd( dir->fd );
++    if (darwin_kqueue_fd && fd != -1)
++    {
++        EV_SET( &event, fd, EVFILT_VNODE, EV_DELETE, 0, 0, NULL );
++        kevent( get_unix_fd( darwin_kqueue_fd ), &event, 1, NULL, 0, NULL );
++    }
++    dir->darwin_registered = 0;
++    darwin_free_snapshot( &dir->darwin_snapshot );
++}
++
++#endif /* __APPLE__ */
++
+ #ifdef HAVE_SYS_INOTIFY_H
+ 
+ #define HASH_SIZE 31
+@@ -1152,6 +1487,10 @@
+     dir->mode = mode;
+     dir->uid  = ~(uid_t)0;
+     dir->client_process = NULL;
++#ifdef __APPLE__
++    dir->darwin_registered = 0;
++    list_init( &dir->darwin_snapshot );
++#endif
+     set_fd_user( fd, &dir_fd_ops, &dir->obj );
+ 
+     dir_add_to_existing_notify( dir );
+@@ -1220,7 +1559,11 @@
+         fd_async_wake_up( dir->fd, ASYNC_TYPE_WAIT, STATUS_ALERTED );
+ 
+     /* setup the real notification */
+-    if (!inotify_adjust_changes( dir ))
++    if (!inotify_adjust_changes( dir )
++#ifdef __APPLE__
++        && !darwin_adjust_changes( dir )
++#endif
++       )
+         dnotify_adjust_changes( dir );
+ 
+     set_error(STATUS_PENDING);
+
